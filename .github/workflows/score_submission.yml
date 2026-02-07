@@ -1,0 +1,134 @@
+name: Evaluate Submission
+
+on:
+  pull_request_target:
+    paths:
+      - 'submissions/inbox/**'
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1️⃣ Checkout trusted code (main branch)
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      # 3️⃣ Set up Python
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # 4️⃣ Install dependencies
+      - name: Install dependencies
+        run: |
+          pip install pandas scikit-learn
+
+      - name: Find submission file (from PR)
+        id: find_submission
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            if (!pr) {
+              core.setFailed("No pull request context available.");
+              return;
+            }
+            const files = await github.paginate(
+              github.rest.pulls.listFiles,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                per_page: 100,
+              }
+            );
+            const predictionFile = files
+              .map(f => f.filename)
+              .find(name => name.startsWith("submissions/inbox/") && name.endsWith("/predictions.csv"));
+            const metadataFile = files
+              .map(f => f.filename)
+              .find(name => name.startsWith("submissions/inbox/") && name.endsWith("/metadata.json"));
+
+            if (!predictionFile || !metadataFile) {
+              core.setFailed("Submission must include predictions.csv and metadata.json under submissions/inbox/<team>/<run_id>/");
+              return;
+            }
+
+            const parts = predictionFile.split("/");
+            if (parts.length < 5) {
+              core.setFailed("Invalid submission path. Expected submissions/inbox/<team>/<run_id>/predictions.csv");
+              return;
+            }
+
+            core.setOutput("prediction", predictionFile);
+            core.setOutput("metadata", metadataFile);
+            core.setOutput("head_repo", pr.head.repo.full_name);
+            core.setOutput("head_sha", pr.head.sha);
+            core.setOutput("submitter", pr.user.login);
+
+      - name: Download submission files (read-only)
+        id: download_submission
+        env:
+          PRED_PATH: ${{ steps.find_submission.outputs.prediction }}
+          META_PATH: ${{ steps.find_submission.outputs.metadata }}
+          HEAD_REPO: ${{ steps.find_submission.outputs.head_repo }}
+          HEAD_SHA: ${{ steps.find_submission.outputs.head_sha }}
+        run: |
+          if [ -z "$PRED_PATH" ] || [ -z "$META_PATH" ] || [ -z "$HEAD_REPO" ] || [ -z "$HEAD_SHA" ]; then
+            echo "Missing PR submission metadata"
+            exit 1
+          fi
+          case "$PRED_PATH" in
+            submissions/inbox/*/*/predictions.csv) ;;
+            *) echo "Invalid submission path: $PRED_PATH"; exit 1 ;;
+          esac
+          case "$META_PATH" in
+            submissions/inbox/*/*/metadata.json) ;;
+            *) echo "Invalid metadata path: $META_PATH"; exit 1 ;;
+          esac
+          PRED_URL="https://raw.githubusercontent.com/${HEAD_REPO}/${HEAD_SHA}/${PRED_PATH}"
+          META_URL="https://raw.githubusercontent.com/${HEAD_REPO}/${HEAD_SHA}/${META_PATH}"
+          curl -fsSL "$PRED_URL" -o /tmp/pr_predictions.csv
+          curl -fsSL "$META_URL" -o /tmp/pr_metadata.json
+
+      - name: Validate submission format
+        run: |
+          python competition/validate_submission.py /tmp/pr_predictions.csv
+
+      # 5️⃣ Clone private labels repo
+      - name: Clone private labels repo
+        env:
+          EVAL_TOKEN: ${{ secrets.EVAL_TOKEN }}
+        run: |
+          git clone https://${EVAL_TOKEN}@github.com/abdksm/TRACE-GNN-private.git private_labels
+
+      # 6️⃣ Run scoring
+      - name: Run scoring
+        run: |
+          python evaluate.py /tmp/pr_predictions.csv private_labels/test_labels.csv /tmp/score.txt
+
+      # 7️⃣ Prepare repo for pushing leaderboard update
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # 8️⃣ Update leaderboard.csv
+      - name: Update leaderboard
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git checkout main
+          python update_leaderboard.py /tmp/score.txt /tmp/pr_metadata.json
+
+      # 9️⃣ Commit and push leaderboard
+      - name: Commit leaderboard update
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: |
+          git update leaderboard.csv
+          git commit -m "Update leaderboard"
+          git push https://${BOT_TOKEN}@github.com/abdksm/TRACE-GNN.git main
